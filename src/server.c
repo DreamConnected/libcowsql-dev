@@ -105,7 +105,7 @@ int cowsql__init(struct cowsql_node *d,
 	raft_set_pre_vote(&d->raft, true);
 	raft_set_max_catch_up_rounds(&d->raft, 100);
 	raft_set_max_catch_up_round_duration(&d->raft, 50 * 1000); /* 50 secs */
-	rv = sem_init(&d->ready, 0, 0);
+	rv = uv_sem_init(&d->ready, 0);
 	if (rv != 0) {
 		snprintf(d->errmsg, COWSQL_ERRMSG_BUF_SIZE, "sem_init(): %s",
 			 strerror(errno));
@@ -140,7 +140,7 @@ int cowsql__init(struct cowsql_node *d,
 	return 0;
 
 err_after_ready_init:
-	sem_destroy(&d->ready);
+	uv_sem_destroy(&d->ready);
 err_after_raft_fsm_init:
 	fsm__close(&d->raft_fsm);
 err_after_raft_io_init:
@@ -159,15 +159,12 @@ err:
 
 void cowsql__close(struct cowsql_node *d)
 {
-	int rv;
 	if (!d->initialized) {
 		return;
 	}
 	raft_free(d->listener);
-	rv = sem_destroy(&d->ready);
-	assert(rv == 0); /* Fails only if sem object is not valid */
-	rv = sem_destroy(&d->handover_done);
-	assert(rv == 0);
+	uv_sem_destroy(&d->ready);
+	uv_sem_destroy(&d->handover_done);
 	fsm__close(&d->raft_fsm);
 	// TODO assert rv of uv_loop_close after fixing cleanup logic related to
 	// the TODO above referencing the cleanup logic without running the
@@ -449,7 +446,7 @@ static void destroy_conn(struct conn *conn)
 static void handoverDoneCb(struct cowsql_node *d, int status)
 {
 	d->handover_status = status;
-	sem_post(&d->handover_done);
+	uv_sem_post(&d->handover_done);
 }
 
 static void handoverCb(uv_async_t *handover)
@@ -505,10 +502,8 @@ static void stopCb(uv_async_t *stop)
 static void startup_cb(uv_timer_t *startup)
 {
 	struct cowsql_node *d = startup->data;
-	int rv;
 	d->running = true;
-	rv = sem_post(&d->ready);
-	assert(rv == 0); /* No reason for which posting should fail */
+	uv_sem_post(&d->ready);
 }
 
 static void listenCb(uv_stream_t *listener, int status)
@@ -693,7 +688,7 @@ static int taskRun(struct cowsql_node *d)
 		snprintf(d->errmsg, COWSQL_ERRMSG_BUF_SIZE, "raft_start(): %s",
 			 raft_errmsg(&d->raft));
 		/* Unblock any client of taskReady */
-		sem_post(&d->ready);
+		uv_sem_post(&d->ready);
 		return rv;
 	}
 
@@ -701,8 +696,7 @@ static int taskRun(struct cowsql_node *d)
 	assert(rv == 0);
 
 	/* Unblock any client of taskReady */
-	rv = sem_post(&d->ready);
-	assert(rv == 0); /* no reason for which posting should fail */
+	uv_sem_post(&d->ready);
 
 	return 0;
 }
@@ -767,7 +761,7 @@ void cowsql_node_destroy(cowsql_node *d)
 static bool taskReady(struct cowsql_node *d)
 {
 	/* Wait for the ready semaphore */
-	sem_wait(&d->ready);
+	uv_sem_wait(&d->ready);
 	return d->running;
 }
 
@@ -810,7 +804,7 @@ int cowsql_node_handover(cowsql_node *d)
 	rv = uv_async_send(&d->handover);
 	assert(rv == 0);
 
-	sem_wait(&d->handover_done);
+	uv_sem_wait(&d->handover_done);
 
 	return d->handover_status;
 }
@@ -1226,9 +1220,9 @@ int cowsql_server_create(const char *path, cowsql_server **server)
 	int rv;
 
 	*server = callocChecked(1, sizeof **server);
-	rv = pthread_cond_init(&(*server)->cond, NULL);
+	rv = uv_cond_init(&(*server)->cond);
 	assert(rv == 0);
-	rv = pthread_mutex_init(&(*server)->mutex, NULL);
+	rv = uv_mutex_init(&(*server)->mutex);
 	assert(rv == 0);
 	(*server)->dir_path = strdupChecked(path);
 	(*server)->connect = transportDefaultConnect;
@@ -1464,39 +1458,23 @@ static int bootstrapOrJoinCluster(struct cowsql_server *server,
 	return 0;
 }
 
-static void *refreshTask(void *arg)
+static void refreshTask(void *arg)
 {
 	struct cowsql_server *server = arg;
 	struct client_context context;
-	struct timespec ts;
-	unsigned long long nsec;
+	uint64_t timeout_nsec;
 	int rv;
 
-	rv = pthread_mutex_lock(&server->mutex);
-	assert(rv == 0);
+	uv_mutex_lock(&server->mutex);
+	timeout_nsec = server->refresh_period * 1000 * 1000;
 	for (;;) {
-		rv = clock_gettime(CLOCK_REALTIME, &ts);
-		assert(rv == 0);
-		nsec = (unsigned long long)ts.tv_nsec;
-		nsec += server->refresh_period * 1000 * 1000;
-		while (nsec > 1000 * 1000 * 1000) {
-			nsec -= 1000 * 1000 * 1000;
-			ts.tv_sec += 1;
-		}
-		/* The type of tv_nsec is "an implementation-defined signed type
-		 * capable of holding [the range 0..=999,999,999]". int is the
-		 * narrowest such type (on all the targets we care about), so
-		 * cast to that before doing the assignment to avoid warnings.
-		 */
-		ts.tv_nsec = (int)nsec;
-
-		rv = pthread_cond_timedwait(&server->cond, &server->mutex, &ts);
+		rv = uv_cond_timedwait(&server->cond, &server->mutex,
+				       timeout_nsec);
 		if (server->shutdown) {
-			rv = pthread_mutex_unlock(&server->mutex);
-			assert(rv == 0);
+			uv_mutex_unlock(&server->mutex);
 			break;
 		}
-		assert(rv == 0 || rv == ETIMEDOUT);
+		assert(rv == 0 || rv == UV_ETIMEDOUT);
 
 		clientContextMillis(&context, 5000);
 		if (server->proto.fd == -1) {
@@ -1515,7 +1493,6 @@ static void *refreshTask(void *arg)
 		}
 		writeNodeStore(server);
 	}
-	return NULL;
 }
 
 int cowsql_server_start(cowsql_server *server)
@@ -1644,7 +1621,7 @@ int cowsql_server_start(cowsql_server *server)
 		goto err_after_start_node;
 	}
 
-	rv = pthread_create(&server->refresh_thread, NULL, refreshTask, server);
+	rv = uv_thread_create(&server->refresh_thread, refreshTask, server);
 	assert(rv == 0);
 
 	close(store_fd);
@@ -1684,21 +1661,17 @@ int cowsql_server_handover(cowsql_server *server)
 
 int cowsql_server_stop(cowsql_server *server)
 {
-	void *ret;
 	int rv;
 
 	if (!server->started) {
 		return 1;
 	}
 
-	rv = pthread_mutex_lock(&server->mutex);
-	assert(rv == 0);
+	uv_mutex_lock(&server->mutex);
 	server->shutdown = true;
-	rv = pthread_mutex_unlock(&server->mutex);
-	assert(rv == 0);
-	rv = pthread_cond_signal(&server->cond);
-	assert(rv == 0);
-	rv = pthread_join(server->refresh_thread, &ret);
+	uv_mutex_unlock(&server->mutex);
+	uv_cond_signal(&server->cond);
+	rv = uv_thread_join(&server->refresh_thread);
 	assert(rv == 0);
 
 	emptyCache(&server->cache);
@@ -1715,8 +1688,8 @@ int cowsql_server_stop(cowsql_server *server)
 
 void cowsql_server_destroy(cowsql_server *server)
 {
-	pthread_cond_destroy(&server->cond);
-	pthread_mutex_destroy(&server->mutex);
+	uv_cond_destroy(&server->cond);
+	uv_mutex_destroy(&server->mutex);
 
 	emptyCache(&server->cache);
 

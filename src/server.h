@@ -32,7 +32,6 @@ struct cowsql_node
 	struct raft_io raft_io;                  /* libuv I/O */
 	struct raft_fsm raft_fsm;                /* cowsql FSM */
 	sem_t ready;                             /* Server is ready */
-	sem_t stopped;                           /* Notify loop stopped */
 	sem_t handover_done;
 	queue queue; /* Incoming connections */
 	queue conns; /* Active connections */

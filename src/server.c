@@ -112,19 +112,12 @@ int cowsql__init(struct cowsql_node *d,
 		rv = COWSQL_ERROR;
 		goto err_after_raft_fsm_init;
 	}
-	rv = sem_init(&d->stopped, 0, 0);
-	if (rv != 0) {
-		snprintf(d->errmsg, COWSQL_ERRMSG_BUF_SIZE, "sem_init(): %s",
-			 strerror(errno));
-		rv = COWSQL_ERROR;
-		goto err_after_ready_init;
-	}
 	rv = sem_init(&d->handover_done, 0, 0);
 	if (rv != 0) {
 		snprintf(d->errmsg, COWSQL_ERRMSG_BUF_SIZE, "sem_init(): %s",
 			 strerror(errno));
 		rv = COWSQL_ERROR;
-		goto err_after_stopped_init;
+		goto err_after_ready_init;
 	}
 
 	QUEUE__INIT(&d->queue);
@@ -146,8 +139,6 @@ int cowsql__init(struct cowsql_node *d,
 	d->initialized = true;
 	return 0;
 
-err_after_stopped_init:
-	sem_destroy(&d->stopped);
 err_after_ready_init:
 	sem_destroy(&d->ready);
 err_after_raft_fsm_init:
@@ -173,8 +164,6 @@ void cowsql__close(struct cowsql_node *d)
 		return;
 	}
 	raft_free(d->listener);
-	rv = sem_destroy(&d->stopped);
-	assert(rv == 0); /* Fails only if sem object is not valid */
 	rv = sem_destroy(&d->ready);
 	assert(rv == 0); /* Fails only if sem object is not valid */
 	rv = sem_destroy(&d->handover_done);

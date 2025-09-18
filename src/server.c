@@ -607,7 +607,7 @@ err:
 static void monitor_cb(struct raft *r)
 {
 	struct cowsql_node *d = r->data;
-	int state = raft_state(&d->raft);
+	int state = (int)raft_state(&d->raft);
 	queue *head;
 	struct conn *conn;
 
